@@ -780,10 +780,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
-	// Run server in a goroutine so it doesn't block
+	// Run server in a goroutine so it doesn't block.
+	// Exit the process on failure so launchd / supervisors can restart us —
+	// the bridge is useless to the MCP server without the REST endpoint.
 	go func() {
 		if err := http.ListenAndServe(serverAddr, nil); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
+			os.Exit(1)
 		}
 	}()
 }
