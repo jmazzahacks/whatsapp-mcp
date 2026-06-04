@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -61,14 +62,20 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
 
-	// Create tables if they don't exist
+	// Create tables if they don't exist.
+	//
+	// contacts is the fork's local cache of whatsmeow's contact + LID stores
+	// (whatsapp.db). We mirror it into messages.db so the Python MCP can
+	// resolve identity across phone JIDs and @lid JIDs in a single query.
+	// phone_jid is the canonical row key when known; lid-only contacts are
+	// allowed (phone_jid empty string, lid populated).
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
 			last_message_time TIMESTAMP
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -85,6 +92,23 @@ func NewMessageStore() (*MessageStore, error) {
 			file_length INTEGER,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+		);
+
+		CREATE TABLE IF NOT EXISTS contacts (
+			phone_jid TEXT UNIQUE,
+			lid TEXT UNIQUE,
+			display_name TEXT,
+			push_name TEXT,
+			first_name TEXT,
+			business_name TEXT,
+			updated_at TIMESTAMP,
+			CHECK (phone_jid IS NOT NULL OR lid IS NOT NULL)
+		);
+		CREATE INDEX IF NOT EXISTS idx_contacts_lid ON contacts(lid);
+
+		CREATE TABLE IF NOT EXISTS meta (
+			key TEXT PRIMARY KEY,
+			value TEXT
 		);
 	`)
 	if err != nil {
@@ -172,6 +196,558 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	}
 
 	return chats, nil
+}
+
+// ContactRow is the resolved contact row used for identity lookups.
+// Empty strings mean "unknown" (NULL in the database).
+type ContactRow struct {
+	PhoneJID     string
+	LID          string
+	DisplayName  string
+	PushName     string
+	FirstName    string
+	BusinessName string
+}
+
+// BestName returns the best human-readable name available, preferring the
+// most authoritative source (display name from the contact book) over
+// push/business names.
+func (c ContactRow) BestName() string {
+	switch {
+	case c.DisplayName != "":
+		return c.DisplayName
+	case c.FirstName != "":
+		return c.FirstName
+	case c.BusinessName != "":
+		return c.BusinessName
+	case c.PushName != "":
+		return c.PushName
+	}
+	return ""
+}
+
+// nullIfEmpty converts an empty string to a nil interface so the database/sql
+// driver writes a true NULL (the UNIQUE constraints on contacts.phone_jid /
+// contacts.lid need NULLs, not empty strings, to allow multiple "unknown" rows).
+func nullIfEmpty(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// LookupContactByJID resolves any sender/chat JID (phone JID, @lid JID, or a
+// bare user part) to the contact row that owns it. Returns nil if no match.
+func (store *MessageStore) LookupContactByJID(jid string) (*ContactRow, error) {
+	if jid == "" {
+		return nil, nil
+	}
+
+	// Try a direct match on either identifier first; this is the common path.
+	rows, err := store.db.Query(`
+		SELECT COALESCE(phone_jid,''), COALESCE(lid,''),
+		       COALESCE(display_name,''), COALESCE(push_name,''),
+		       COALESCE(first_name,''), COALESCE(business_name,'')
+		FROM contacts
+		WHERE phone_jid = ? OR lid = ?
+		LIMIT 1
+	`, jid, jid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if rows.Next() {
+		var c ContactRow
+		if err := rows.Scan(&c.PhoneJID, &c.LID, &c.DisplayName, &c.PushName, &c.FirstName, &c.BusinessName); err != nil {
+			return nil, err
+		}
+		return &c, nil
+	}
+
+	// Fallback: if the caller passed a bare user part (no '@'), try to match
+	// the user portion of stored JIDs. This handles old sender rows that were
+	// written before sender normalization landed.
+	if !strings.Contains(jid, "@") {
+		pattern1 := jid + "@s.whatsapp.net"
+		pattern2 := jid + "@lid"
+		rows2, err := store.db.Query(`
+			SELECT COALESCE(phone_jid,''), COALESCE(lid,''),
+			       COALESCE(display_name,''), COALESCE(push_name,''),
+			       COALESCE(first_name,''), COALESCE(business_name,'')
+			FROM contacts
+			WHERE phone_jid = ? OR lid = ?
+			LIMIT 1
+		`, pattern1, pattern2)
+		if err != nil {
+			return nil, err
+		}
+		defer rows2.Close()
+		if rows2.Next() {
+			var c ContactRow
+			if err := rows2.Scan(&c.PhoneJID, &c.LID, &c.DisplayName, &c.PushName, &c.FirstName, &c.BusinessName); err != nil {
+				return nil, err
+			}
+			return &c, nil
+		}
+	}
+	return nil, nil
+}
+
+// CanonicalSenderJID returns the canonical sender form for an incoming JID.
+// Phone JID wins when known, otherwise LID, otherwise the input is returned
+// unchanged (with any device part stripped by the caller before invocation).
+func (store *MessageStore) CanonicalSenderJID(jid string) string {
+	if jid == "" {
+		return jid
+	}
+	contact, err := store.LookupContactByJID(jid)
+	if err != nil || contact == nil {
+		return jid
+	}
+	if contact.PhoneJID != "" {
+		return contact.PhoneJID
+	}
+	if contact.LID != "" {
+		return contact.LID
+	}
+	return jid
+}
+
+// UpsertContact merges a single contact row into the contacts table. At
+// least one of phoneJID or lid must be non-empty. Empty string fields are
+// treated as "no new info" and won't clobber existing values.
+//
+// This handles the merge case where we previously had a row keyed only by
+// lid and later learn the phone_jid (or vice versa) — that row is updated
+// in place rather than producing a UNIQUE constraint conflict.
+func (store *MessageStore) UpsertContact(phoneJID, lid, displayName, pushName, firstName, businessName string) error {
+	if phoneJID == "" && lid == "" {
+		return fmt.Errorf("UpsertContact: need at least one of phone_jid or lid")
+	}
+
+	tx, err := store.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Find any existing rows that match either identifier. There can be at
+	// most two: one matching phone_jid, one matching lid. If they collide on
+	// a single row we just update; if they're two separate rows we merge.
+	type existingRow struct {
+		phoneJID, lid, displayName, pushName, firstName, businessName sql.NullString
+	}
+	rows, err := tx.Query(`
+		SELECT phone_jid, lid, display_name, push_name, first_name, business_name
+		FROM contacts
+		WHERE (? != '' AND phone_jid = ?) OR (? != '' AND lid = ?)
+	`, phoneJID, phoneJID, lid, lid)
+	if err != nil {
+		return err
+	}
+	var existing []existingRow
+	for rows.Next() {
+		var r existingRow
+		if err := rows.Scan(&r.phoneJID, &r.lid, &r.displayName, &r.pushName, &r.firstName, &r.businessName); err != nil {
+			rows.Close()
+			return err
+		}
+		existing = append(existing, r)
+	}
+	rows.Close()
+
+	// Merge whatever we found with the new info; later writes win for
+	// non-empty fields.
+	finalPN := phoneJID
+	finalLID := lid
+	finalDisplay := displayName
+	finalPush := pushName
+	finalFirst := firstName
+	finalBusiness := businessName
+	for _, r := range existing {
+		if finalPN == "" && r.phoneJID.Valid {
+			finalPN = r.phoneJID.String
+		}
+		if finalLID == "" && r.lid.Valid {
+			finalLID = r.lid.String
+		}
+		if finalDisplay == "" && r.displayName.Valid {
+			finalDisplay = r.displayName.String
+		}
+		if finalPush == "" && r.pushName.Valid {
+			finalPush = r.pushName.String
+		}
+		if finalFirst == "" && r.firstName.Valid {
+			finalFirst = r.firstName.String
+		}
+		if finalBusiness == "" && r.businessName.Valid {
+			finalBusiness = r.businessName.String
+		}
+	}
+
+	// Wipe the matching rows and write one merged row.
+	if len(existing) > 0 {
+		_, err = tx.Exec(`
+			DELETE FROM contacts
+			WHERE (? != '' AND phone_jid = ?) OR (? != '' AND lid = ?)
+		`, phoneJID, phoneJID, lid, lid)
+		if err != nil {
+			return err
+		}
+	}
+
+	_, err = tx.Exec(`
+		INSERT INTO contacts (phone_jid, lid, display_name, push_name, first_name, business_name, updated_at)
+		VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?)
+	`, nullIfEmpty(finalPN), nullIfEmpty(finalLID), finalDisplay, finalPush, finalFirst, finalBusiness, time.Now())
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// CountContacts returns the number of rows in the contacts table.
+func (store *MessageStore) CountContacts() (int, error) {
+	var n int
+	err := store.db.QueryRow("SELECT COUNT(*) FROM contacts").Scan(&n)
+	return n, err
+}
+
+// GetMeta reads a value from the meta key/value table. Returns ("", nil) if
+// the key doesn't exist.
+func (store *MessageStore) GetMeta(key string) (string, error) {
+	var v string
+	err := store.db.QueryRow("SELECT value FROM meta WHERE key = ?", key).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return v, err
+}
+
+// SetMeta writes a value to the meta key/value table.
+func (store *MessageStore) SetMeta(key, value string) error {
+	_, err := store.db.Exec("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", key, value)
+	return err
+}
+
+// syncContactsMu serializes calls to syncContactsFromWhatsmeow. Two paths
+// can fire concurrently — the post-connect startup goroutine and the
+// post-HistorySync goroutine. Both run a full DELETE+INSERT, so overlapping
+// runs are wasteful and produce confusing log output; the mutex makes the
+// second one wait for the first to finish.
+var syncContactsMu sync.Mutex
+
+// syncContactsFromWhatsmeow does a one-shot rebuild of the contacts table
+// from whatsmeow's internal stores (whatsapp.db's whatsmeow_contacts and
+// whatsmeow_lid_map). The table is replaced wholesale so stale rows are
+// dropped — incremental updates afterward come from events.Contact /
+// events.PushName handlers.
+func syncContactsFromWhatsmeow(client *whatsmeow.Client, store *MessageStore, logger waLog.Logger) error {
+	syncContactsMu.Lock()
+	defer syncContactsMu.Unlock()
+
+	ctx := context.Background()
+
+	contacts, err := client.Store.Contacts.GetAllContacts(ctx)
+	if err != nil {
+		return fmt.Errorf("GetAllContacts: %w", err)
+	}
+	logger.Infof("Syncing %d contacts from whatsmeow", len(contacts))
+
+	// Collect every PN we know about so we can bulk-resolve LIDs in one call.
+	var phoneJIDs []types.JID
+	for jid := range contacts {
+		if jid.Server == types.DefaultUserServer {
+			phoneJIDs = append(phoneJIDs, jid.ToNonAD())
+		}
+	}
+	pnToLID, err := client.Store.LIDs.GetManyLIDsForPNs(ctx, phoneJIDs)
+	if err != nil {
+		logger.Warnf("GetManyLIDsForPNs: %v (continuing without bulk LID map)", err)
+		pnToLID = make(map[types.JID]types.JID)
+	}
+
+	// Build a merged set keyed by canonical identity. Both PN-keyed and
+	// LID-keyed entries for the same person need to collapse into one row.
+	type row struct {
+		phoneJID, lid string
+		info          types.ContactInfo
+	}
+	merged := make(map[string]*row) // key = phone JID if known, else lid
+	for jid, info := range contacts {
+		nonAD := jid.ToNonAD()
+		var phoneJID, lid string
+		switch nonAD.Server {
+		case types.DefaultUserServer:
+			phoneJID = nonAD.String()
+			if mapped, ok := pnToLID[nonAD]; ok && !mapped.IsEmpty() {
+				lid = mapped.ToNonAD().String()
+			}
+		case types.HiddenUserServer:
+			lid = nonAD.String()
+			pn, err := client.Store.LIDs.GetPNForLID(ctx, nonAD)
+			if err == nil && !pn.IsEmpty() {
+				phoneJID = pn.ToNonAD().String()
+			}
+		default:
+			continue
+		}
+
+		key := phoneJID
+		if key == "" {
+			key = lid
+		}
+		if existing, ok := merged[key]; ok {
+			if existing.phoneJID == "" {
+				existing.phoneJID = phoneJID
+			}
+			if existing.lid == "" {
+				existing.lid = lid
+			}
+			if existing.info.FullName == "" {
+				existing.info.FullName = info.FullName
+			}
+			if existing.info.FirstName == "" {
+				existing.info.FirstName = info.FirstName
+			}
+			if existing.info.PushName == "" {
+				existing.info.PushName = info.PushName
+			}
+			if existing.info.BusinessName == "" {
+				existing.info.BusinessName = info.BusinessName
+			}
+		} else {
+			merged[key] = &row{phoneJID: phoneJID, lid: lid, info: info}
+		}
+	}
+
+	// Replace the table in one transaction so callers always see a
+	// consistent snapshot.
+	tx, err := store.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("DELETE FROM contacts"); err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare(`
+		INSERT INTO contacts (phone_jid, lid, display_name, push_name, first_name, business_name, updated_at)
+		VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?)
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	now := time.Now()
+	inserted := 0
+	for _, r := range merged {
+		if r.phoneJID == "" && r.lid == "" {
+			continue
+		}
+		_, err := stmt.Exec(nullIfEmpty(r.phoneJID), nullIfEmpty(r.lid),
+			r.info.FullName, r.info.PushName, r.info.FirstName, r.info.BusinessName, now)
+		if err != nil {
+			logger.Warnf("Failed to insert contact (phone=%s lid=%s): %v", r.phoneJID, r.lid, err)
+			continue
+		}
+		inserted++
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	logger.Infof("Synced %d contact rows into messages.db", inserted)
+	return nil
+}
+
+// backfillSenderJIDs upgrades historical messages.sender rows from the legacy
+// bare-user-part format (e.g. "14155551234" or "113851144110310") to canonical
+// full JIDs ("14155551234@s.whatsapp.net" / "113851144110310@lid") using the
+// contacts table. Rows that can't be resolved are left alone; the Python read
+// path has a bare-user fallback that still matches them.
+//
+// Idempotent and gated by a meta marker so subsequent startups skip the scan.
+// Bump the marker key when the resolution rules change.
+func backfillSenderJIDs(store *MessageStore, logger waLog.Logger) error {
+	const markerKey = "backfill.senders.v1"
+	marker, err := store.GetMeta(markerKey)
+	if err != nil {
+		return fmt.Errorf("read backfill marker: %w", err)
+	}
+	if marker == "done" {
+		return nil
+	}
+
+	rows, err := store.db.Query(`
+		SELECT DISTINCT sender FROM messages
+		WHERE sender != '' AND sender NOT LIKE '%@%'
+	`)
+	if err != nil {
+		return err
+	}
+	var bareSenders []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			rows.Close()
+			return err
+		}
+		bareSenders = append(bareSenders, s)
+	}
+	rows.Close()
+
+	if len(bareSenders) == 0 {
+		logger.Infof("Sender backfill: nothing to do")
+		return store.SetMeta(markerKey, "done")
+	}
+
+	logger.Infof("Sender backfill: scanning %d unique bare senders", len(bareSenders))
+
+	// Wrap the per-sender UPDATEs in one transaction. Without it each
+	// UPDATE is an autocommit and SQLite issues a separate fsync per row,
+	// making the backfill orders of magnitude slower on busy databases.
+	// The lookup itself is read-only so it stays outside the tx.
+	tx, err := store.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin backfill tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	updated := 0
+	resolved := 0
+	for _, raw := range bareSenders {
+		contact, err := store.LookupContactByJID(raw)
+		if err != nil {
+			logger.Warnf("backfill: lookup failed for %s: %v", raw, err)
+			continue
+		}
+		if contact == nil {
+			// Stays bare for now. The Python read-side fallback in
+			// _all_jids_for_identifier still matches bare-user rows, so
+			// callers continue to work; but a future bridge version that
+			// learns this contact won't retroactively normalize old rows
+			// unless we bump the marker key to re-run the backfill.
+			continue
+		}
+		var canonical string
+		if contact.PhoneJID != "" {
+			canonical = contact.PhoneJID
+		} else if contact.LID != "" {
+			canonical = contact.LID
+		}
+		if canonical == "" || canonical == raw {
+			continue
+		}
+		result, err := tx.Exec("UPDATE messages SET sender = ? WHERE sender = ?", canonical, raw)
+		if err != nil {
+			logger.Warnf("backfill: update %s -> %s failed: %v", raw, canonical, err)
+			continue
+		}
+		n, _ := result.RowsAffected()
+		updated += int(n)
+		resolved++
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit backfill tx: %w", err)
+	}
+
+	logger.Infof("Sender backfill: resolved %d/%d distinct senders, updated %d message rows", resolved, len(bareSenders), updated)
+	return store.SetMeta(markerKey, "done")
+}
+
+// identifiersFor returns (phoneJID, lid) for a JID, based on its server type.
+// Only one of the two will be populated unless we can resolve the cross-mapping
+// from whatsmeow's LID store.
+func identifiersFor(client *whatsmeow.Client, jid types.JID) (string, string) {
+	ctx := context.Background()
+	nonAD := jid.ToNonAD()
+	var phoneJID, lid string
+	switch nonAD.Server {
+	case types.DefaultUserServer:
+		phoneJID = nonAD.String()
+		if mapped, err := client.Store.LIDs.GetLIDForPN(ctx, nonAD); err == nil && !mapped.IsEmpty() {
+			lid = mapped.ToNonAD().String()
+		}
+	case types.HiddenUserServer:
+		lid = nonAD.String()
+		if pn, err := client.Store.LIDs.GetPNForLID(ctx, nonAD); err == nil && !pn.IsEmpty() {
+			phoneJID = pn.ToNonAD().String()
+		}
+	}
+	return phoneJID, lid
+}
+
+// handleContactEvent updates the contacts table when whatsmeow's contact
+// store changes (e.g. the user edits a contact on another device).
+func handleContactEvent(client *whatsmeow.Client, store *MessageStore, evt *events.Contact, logger waLog.Logger) {
+	info, err := client.Store.Contacts.GetContact(context.Background(), evt.JID.ToNonAD())
+	if err != nil {
+		logger.Warnf("Contact event for %s: GetContact failed: %v", evt.JID, err)
+		return
+	}
+	phoneJID, lid := identifiersFor(client, evt.JID)
+	if phoneJID == "" && lid == "" {
+		return
+	}
+	if err := store.UpsertContact(phoneJID, lid, info.FullName, info.PushName, info.FirstName, info.BusinessName); err != nil {
+		logger.Warnf("Contact event upsert failed for %s: %v", evt.JID, err)
+	}
+}
+
+// handlePushNameEvent updates the cached push name for a sender.
+func handlePushNameEvent(store *MessageStore, evt *events.PushName, logger waLog.Logger) {
+	var phoneJID, lid string
+	switch evt.JID.ToNonAD().Server {
+	case types.DefaultUserServer:
+		phoneJID = evt.JID.ToNonAD().String()
+	case types.HiddenUserServer:
+		lid = evt.JID.ToNonAD().String()
+	default:
+		return
+	}
+	// JIDAlt is set when whatsmeow knows the cross-mapped identifier; use it
+	// to populate the other column when we have it.
+	if !evt.JIDAlt.IsEmpty() {
+		alt := evt.JIDAlt.ToNonAD()
+		switch alt.Server {
+		case types.DefaultUserServer:
+			if phoneJID == "" {
+				phoneJID = alt.String()
+			}
+		case types.HiddenUserServer:
+			if lid == "" {
+				lid = alt.String()
+			}
+		}
+	}
+	if phoneJID == "" && lid == "" {
+		return
+	}
+	if err := store.UpsertContact(phoneJID, lid, "", evt.NewPushName, "", ""); err != nil {
+		logger.Warnf("PushName event upsert failed for %s: %v", evt.JID, err)
+	}
+}
+
+// handleBusinessNameEvent updates the cached business name for a sender.
+func handleBusinessNameEvent(store *MessageStore, evt *events.BusinessName, logger waLog.Logger) {
+	var phoneJID, lid string
+	switch evt.JID.ToNonAD().Server {
+	case types.DefaultUserServer:
+		phoneJID = evt.JID.ToNonAD().String()
+	case types.HiddenUserServer:
+		lid = evt.JID.ToNonAD().String()
+	default:
+		return
+	}
+	if err := store.UpsertContact(phoneJID, lid, "", "", "", evt.NewBusinessName); err != nil {
+		logger.Warnf("BusinessName event upsert failed for %s: %v", evt.JID, err)
+	}
 }
 
 // Extract text content from a message
@@ -414,10 +990,15 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	// Persist the full sender JID (server included, device stripped) so we
+	// can distinguish phone JIDs from @lid JIDs downstream. Then map to the
+	// canonical form via the contacts table — if we know both identifiers
+	// for this person we always prefer phone JID for consistency.
+	rawSenderJID := msg.Info.Sender.ToNonAD().String()
+	sender := messageStore.CanonicalSenderJID(rawSenderJID)
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, msg.Info.Sender.User, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -852,8 +1433,30 @@ func main() {
 			handleMessage(client, messageStore, v, logger)
 
 		case *events.HistorySync:
-			// Process history sync events
+			// Process history sync events. The first history sync after pairing
+			// is also when whatsmeow's contact store gets populated, so
+			// re-run the contact sync afterward to mirror it into messages.db.
+			// The backfill is re-attempted too — it self-skips if the marker
+			// already says done.
 			handleHistorySync(client, messageStore, v, logger)
+			go func() {
+				if err := syncContactsFromWhatsmeow(client, messageStore, logger); err != nil {
+					logger.Warnf("Post-history-sync contact rebuild failed: %v", err)
+					return
+				}
+				if err := backfillSenderJIDs(messageStore, logger); err != nil {
+					logger.Warnf("Sender backfill failed: %v", err)
+				}
+			}()
+
+		case *events.Contact:
+			handleContactEvent(client, messageStore, v, logger)
+
+		case *events.PushName:
+			handlePushNameEvent(messageStore, v, logger)
+
+		case *events.BusinessName:
+			handleBusinessNameEvent(messageStore, v, logger)
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
@@ -919,6 +1522,24 @@ func main() {
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+
+	// Mirror whatsmeow's contact + LID stores into messages.db so the Python
+	// MCP can resolve identity across phone JIDs and @lid JIDs. Background
+	// goroutine so a slow contact store doesn't delay REST startup. The
+	// HistorySync event handler also re-runs this for first-time pairings
+	// where the contact store fills in only after history arrives.
+	//
+	// Once contacts are populated, run the one-time sender backfill so old
+	// messages stored with bare-user-part senders pick up canonical JIDs.
+	go func() {
+		if err := syncContactsFromWhatsmeow(client, messageStore, logger); err != nil {
+			logger.Warnf("Initial contact sync failed: %v", err)
+			return
+		}
+		if err := backfillSenderJIDs(messageStore, logger); err != nil {
+			logger.Warnf("Sender backfill failed: %v", err)
+		}
+	}()
 
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
@@ -1002,16 +1623,25 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
-			name = sender
-		} else {
-			// Last fallback to JID
-			name = jid.User
+		// Prefer the local contacts table — it resolves names across phone JID
+		// and @lid identifiers in one lookup. Fall back to whatsmeow's contact
+		// store only if our cache hasn't seen this person yet.
+		if cached, err := messageStore.LookupContactByJID(chatJID); err == nil && cached != nil {
+			if n := cached.BestName(); n != "" {
+				name = n
+			}
+		}
+		if name == "" {
+			contact, err := client.Store.Contacts.GetContact(context.Background(), jid.ToNonAD())
+			if err == nil && contact.FullName != "" {
+				name = contact.FullName
+			} else if err == nil && contact.PushName != "" {
+				name = contact.PushName
+			} else if sender != "" {
+				name = sender
+			} else {
+				name = jid.User
+			}
 		}
 
 		logger.Infof("Using contact name: %s", name)
@@ -1095,23 +1725,30 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Determine sender
-				var sender string
+				// Determine sender as a full JID (device stripped). Falling
+				// back to the chat JID for 1:1 messages keeps the same person
+				// across all three identifier formats by virtue of the
+				// canonical lookup below.
+				var senderJID types.JID
 				isFromMe := false
 				if msg.Message.Key != nil {
 					if msg.Message.Key.FromMe != nil {
 						isFromMe = *msg.Message.Key.FromMe
 					}
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
-					} else if isFromMe {
-						sender = client.Store.ID.User
+						if parsed, err := types.ParseJID(*msg.Message.Key.Participant); err == nil {
+							senderJID = parsed.ToNonAD()
+						}
+					} else if isFromMe && client.Store.ID != nil {
+						senderJID = client.Store.ID.ToNonAD()
 					} else {
-						sender = jid.User
+						senderJID = jid.ToNonAD()
 					}
 				} else {
-					sender = jid.User
+					senderJID = jid.ToNonAD()
 				}
+				rawSenderJID := senderJID.String()
+				sender := messageStore.CanonicalSenderJID(rawSenderJID)
 
 				// Store message
 				msgID := ""

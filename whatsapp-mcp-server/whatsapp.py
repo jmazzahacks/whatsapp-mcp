@@ -49,9 +49,20 @@ class Chat:
 
 @dataclass
 class Contact:
+    """A WhatsApp contact resolved across both identifier formats.
+
+    `phone_jid` is the traditional `<number>@s.whatsapp.net` form; `lid` is
+    the newer `<id>@lid` form. One of them may be empty if the bridge has
+    only seen this person under a single identifier. `jid` is whichever one
+    is preferred for send/lookup operations (phone JID when known).
+    `phone_number` is the bare digits of the phone JID when known, otherwise
+    empty — do not use it to identify the contact; use `jid` / `lid`.
+    """
     phone_number: str
     name: Optional[str]
     jid: str
+    phone_jid: str = ""
+    lid: str = ""
 
 @dataclass
 class MessageContext:
@@ -59,43 +70,151 @@ class MessageContext:
     before: List[Message]
     after: List[Message]
 
+_CONTACT_COLS = (
+    "COALESCE(phone_jid,'') AS phone_jid, "
+    "COALESCE(lid,'') AS lid, "
+    "COALESCE(display_name,'') AS display_name, "
+    "COALESCE(push_name,'') AS push_name, "
+    "COALESCE(first_name,'') AS first_name, "
+    "COALESCE(business_name,'') AS business_name"
+)
+
+
+def _normalize_phone_digits(value: str) -> str:
+    """Strip everything except digits from a phone-like string."""
+    if not value:
+        return ""
+    return "".join(c for c in value if c.isdigit())
+
+
+def _lookup_contact_row(cursor, identifier: str):
+    """Look up a single contact row matching `identifier` (a phone JID, an
+    @lid JID, a bare phone number, or a bare LID user-part).
+
+    Returns a 6-tuple (phone_jid, lid, display_name, push_name, first_name,
+    business_name) with empty strings for NULL columns, or None on no match.
+
+    Tolerates the contacts table being absent — returns None in that case
+    so callers can fall back to chats-table heuristics during the window
+    between deploying this MCP code and restarting the bridge.
+    """
+    if not identifier:
+        return None
+
+    try:
+        # Exact match on either identifier column — the common case.
+        cursor.execute(
+            f"SELECT {_CONTACT_COLS} FROM contacts WHERE phone_jid = ? OR lid = ? LIMIT 1",
+            (identifier, identifier),
+        )
+        row = cursor.fetchone()
+        if row:
+            return row
+
+        # Bare-user fallback: try the same user-part as both @s.whatsapp.net
+        # and @lid suffixes. Handles legacy senders and phone-number args
+        # from tools.
+        digits = _normalize_phone_digits(identifier)
+        candidates = []
+        if "@" not in identifier:
+            candidates.append(identifier)
+        if digits and digits != identifier:
+            candidates.append(digits)
+        for user in candidates:
+            cursor.execute(
+                f"SELECT {_CONTACT_COLS} FROM contacts WHERE phone_jid = ? OR lid = ? LIMIT 1",
+                (f"{user}@s.whatsapp.net", f"{user}@lid"),
+            )
+            row = cursor.fetchone()
+            if row:
+                return row
+    except sqlite3.OperationalError as e:
+        # "no such table: contacts" while the bridge hasn't been restarted
+        # yet. Logged at debug to avoid spamming the steady-state log.
+        logger.debug("Contacts table unavailable for lookup: %s", e)
+    return None
+
+
+def _best_contact_name(row) -> str:
+    """Pick the best human-readable name from a contact row tuple."""
+    if not row:
+        return ""
+    _phone_jid, _lid, display, push, first, business = row
+    return display or first or business or push or ""
+
+
+def _all_jids_for_identifier(cursor, identifier: str) -> List[str]:
+    """Return every JID and bare-user form known for the person matched by
+    `identifier`. Used to expand a phone-number lookup into the set of sender
+    values that may appear in the messages table (canonical + legacy)."""
+    if not identifier:
+        return []
+
+    seen: List[str] = []
+
+    def add(value: str) -> None:
+        if value and value not in seen:
+            seen.append(value)
+
+    contact = _lookup_contact_row(cursor, identifier)
+    if contact:
+        phone_jid, lid, *_ = contact
+        if phone_jid:
+            add(phone_jid)
+            add(phone_jid.split("@")[0])
+        if lid:
+            add(lid)
+            add(lid.split("@")[0])
+
+    # Always include the raw identifier so we still match rows that haven't
+    # been backfilled or whose contact row is missing.
+    add(identifier)
+    if "@" not in identifier:
+        # Bare input. The same digits as a phone-server user-part and as an
+        # @lid user-part are completely unrelated people, so we must NOT
+        # synthesize the cross-server form without contacts evidence — doing
+        # so could fold a stranger's @lid chat into a phone-number lookup.
+        # When `contact` resolved above, both forms are already in `seen`.
+        digits = _normalize_phone_digits(identifier) or identifier
+        if contact:
+            add(f"{digits}@s.whatsapp.net")
+            add(f"{digits}@lid")
+        else:
+            # Default to phone form only — bare phone numbers are the
+            # documented input for the affected tools, and pre-LID legacy
+            # senders were stored as digits with no server.
+            add(f"{digits}@s.whatsapp.net")
+        add(digits)
+    else:
+        # Full JID — safe to also match the bare user-part since legacy
+        # rows for the same person on the same server might still use it.
+        user_part = identifier.split("@", 1)[0]
+        add(user_part)
+
+    return seen
+
+
 def get_sender_name(sender_jid: str) -> str:
+    """Resolve a sender identifier (phone JID, @lid JID, or bare user part)
+    to a human-readable name via the contacts table populated by the bridge."""
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        # First try matching by exact JID
-        cursor.execute("""
-            SELECT name
-            FROM chats
-            WHERE jid = ?
-            LIMIT 1
-        """, (sender_jid,))
-        
+
+        contact = _lookup_contact_row(cursor, sender_jid)
+        name = _best_contact_name(contact)
+        if name:
+            return name
+
+        # Legacy fallback: the chats table sometimes carries a usable name
+        # (e.g. for group chats or contacts that pre-date the contacts table).
+        cursor.execute("SELECT name FROM chats WHERE jid = ? LIMIT 1", (sender_jid,))
         result = cursor.fetchone()
-        
-        # If no result, try looking for the number within JIDs
-        if not result:
-            # Extract the phone number part if it's a JID
-            if '@' in sender_jid:
-                phone_part = sender_jid.split('@')[0]
-            else:
-                phone_part = sender_jid
-                
-            cursor.execute("""
-                SELECT name
-                FROM chats
-                WHERE jid LIKE ?
-                LIMIT 1
-            """, (f"%{phone_part}%",))
-            
-            result = cursor.fetchone()
-        
         if result and result[0]:
             return result[0]
-        else:
-            return sender_jid
-        
+
+        return sender_jid
+
     except sqlite3.Error as e:
         logger.error(f"Database error while getting sender name: {e}")
         return sender_jid
@@ -176,12 +295,22 @@ def list_messages(
             params.append(before)
 
         if sender_phone_number:
-            where_clauses.append("messages.sender = ?")
-            params.append(sender_phone_number)
-            
+            # Expand the requested identifier to every form that may appear
+            # in messages.sender (phone JID, @lid JID, and bare-user variants
+            # for un-backfilled rows) so phone-number lookups work even when
+            # the underlying chat is @lid-based.
+            sender_jids = _all_jids_for_identifier(cursor, sender_phone_number)
+            placeholders = ",".join(["?"] * len(sender_jids))
+            where_clauses.append(f"messages.sender IN ({placeholders})")
+            params.extend(sender_jids)
+
         if chat_jid:
-            where_clauses.append("messages.chat_jid = ?")
-            params.append(chat_jid)
+            # Likewise allow callers to pass either JID format for the same
+            # person; we'll match both.
+            chat_jids = _all_jids_for_identifier(cursor, chat_jid)
+            placeholders = ",".join(["?"] * len(chat_jids))
+            where_clauses.append(f"messages.chat_jid IN ({placeholders})")
+            params.extend(chat_jids)
             
         if query:
             where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
@@ -376,29 +505,85 @@ def list_chats(
         # Add sorting
         order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "chats.name"
         query_parts.append(f"ORDER BY {order_by}")
-        
-        # Add pagination
-        offset = (page ) * limit
-        query_parts.append("LIMIT ? OFFSET ?")
-        params.extend([limit, offset])
-        
+
+        # Pagination happens post-dedup (see below). Doing it in SQL is
+        # incorrect because dedup collapses adjacent rows by person; an
+        # SQL OFFSET would skip rows that dedup would have merged, causing
+        # both duplicates across pages and silently dropped chats. Instead
+        # we fetch a generous superset, dedup, then slice. WhatsApp users
+        # rarely have more than a few hundred chats so the upper bound is
+        # only a guardrail for pathological cases.
+        query_parts.append("LIMIT ?")
+        params.append(5000)
+
         cursor.execute(" ".join(query_parts), tuple(params))
         chats = cursor.fetchall()
-        
-        result = []
+
+        # First pass: build raw Chat objects and resolve a contact-aware name.
+        raw_chats: List[Chat] = []
+        person_keys: List[Optional[str]] = []
         for chat_data in chats:
-            chat = Chat(
-                jid=chat_data[0],
-                name=chat_data[1],
+            chat_jid = chat_data[0]
+            chat_name = chat_data[1]
+
+            person_key: Optional[str] = None
+            if not chat_jid.endswith("@g.us"):
+                contact_row = _lookup_contact_row(cursor, chat_jid)
+                if contact_row:
+                    better_name = _best_contact_name(contact_row)
+                    if better_name:
+                        chat_name = better_name
+                    # The person's identity for dedup: prefer phone JID.
+                    person_key = contact_row[0] or contact_row[1] or chat_jid
+                else:
+                    person_key = chat_jid
+
+            raw_chats.append(Chat(
+                jid=chat_jid,
+                name=chat_name,
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
-            )
-            result.append(chat)
-            
-        return result
-        
+                last_is_from_me=chat_data[5],
+            ))
+            person_keys.append(person_key)
+
+        # Second pass: dedup 1:1 chats by person_key, keeping the most recent.
+        # Groups (@g.us, person_key is None) pass through unchanged.
+        merged: dict = {}
+        ordered: List[Chat] = []
+        for chat, key in zip(raw_chats, person_keys):
+            if key is None:
+                ordered.append(chat)
+                continue
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = chat
+                ordered.append(chat)
+                continue
+            # Same person, two chat rows — keep whichever has the newer
+            # last_message_time. Preserve the better name if the loser had one.
+            winner, loser = (chat, existing) if (
+                (chat.last_message_time or datetime.min) >
+                (existing.last_message_time or datetime.min)
+            ) else (existing, chat)
+            if not winner.name and loser.name:
+                winner.name = loser.name
+            # Replace in the ordered list.
+            try:
+                idx = ordered.index(existing)
+                ordered[idx] = winner
+            except ValueError:
+                ordered.append(winner)
+            merged[key] = winner
+
+        # Apply pagination after dedup so callers see consistent page
+        # boundaries even when phone/lid rows for the same person merge.
+        if limit > 0:
+            start = page * limit
+            return ordered[start:start + limit]
+        return ordered
+
     except sqlite3.Error as e:
         logger.error(f"Database error: {e}")
         return []
@@ -408,39 +593,104 @@ def list_chats(
 
 
 def search_contacts(query: str) -> List[Contact]:
-    """Search contacts by name or phone number."""
+    """Search the contacts table by name, push name, business name, phone JID,
+    LID, or bare digits. Returns one Contact per real person — phone JID and
+    LID rows for the same person are already merged by the bridge.
+
+    Also includes any chats whose name matches but lack a contacts row (e.g.
+    group-only contacts the user never saved). Those come back with empty
+    `phone_jid`/`lid` and the chat's JID in `jid`.
+    """
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
+
+        pattern = f"%{query}%"
+        # Only treat the query as a digit search when it's long enough to
+        # avoid bulk-matching everyone who happens to share a 2- or 3-digit
+        # country code or area code. 6 digits is a reasonable lower bound:
+        # short enough to allow partial-number searches, long enough that
+        # the result set is meaningful rather than dragnet.
+        digits = _normalize_phone_digits(query)
+        digits_pattern = f"%{digits}%" if len(digits) >= 6 else None
+
+        # Pull from contacts first. The OR chain matches name fields plus
+        # both identifier columns; the digits clause handles "+39 349 ..."
+        # style queries where the user typed punctuation. If the contacts
+        # table is absent (bridge not restarted yet) we fall through to a
+        # chats-only search below.
+        sql = f"""
+            SELECT {_CONTACT_COLS}
+            FROM contacts
+            WHERE LOWER(display_name) LIKE LOWER(?)
+               OR LOWER(push_name)    LIKE LOWER(?)
+               OR LOWER(first_name)   LIKE LOWER(?)
+               OR LOWER(business_name) LIKE LOWER(?)
+               OR phone_jid LIKE ?
+               OR lid       LIKE ?
+        """
+        params = [pattern, pattern, pattern, pattern, pattern, pattern]
+        if digits_pattern:
+            sql += " OR phone_jid LIKE ? OR lid LIKE ?"
+            params.extend([digits_pattern, digits_pattern])
+        sql += " ORDER BY display_name COLLATE NOCASE, push_name COLLATE NOCASE LIMIT 50"
+
+        try:
+            cursor.execute(sql, tuple(params))
+            rows = cursor.fetchall()
+        except sqlite3.OperationalError as e:
+            logger.debug("Contacts table unavailable for search: %s", e)
+            rows = []
+
+        result: List[Contact] = []
+        seen_keys = set()
+        for row in rows:
+            phone_jid, lid, display, push, first, business = row
+            key = phone_jid or lid
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            name = display or first or business or push or None
+            preferred_jid = phone_jid or lid
+            result.append(Contact(
+                phone_number=phone_jid.split("@")[0] if phone_jid else "",
+                name=name,
+                jid=preferred_jid,
+                phone_jid=phone_jid,
+                lid=lid,
+            ))
+
+        # Backfill: any chats with a name match that aren't represented by
+        # a contacts row (no phone/lid identifier in the result so far).
         cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
+            SELECT DISTINCT jid, name
             FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
+            WHERE (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+              AND jid NOT LIKE '%@g.us'
             ORDER BY name, jid
             LIMIT 50
-        """, (search_pattern, search_pattern))
-        
-        contacts = cursor.fetchall()
-        
-        result = []
-        for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
-            )
-            result.append(contact)
-            
+        """, (pattern, pattern))
+        for chat_jid, chat_name in cursor.fetchall():
+            if chat_jid in seen_keys:
+                continue
+            # Skip if we already have this person via the contacts table.
+            contact_row = _lookup_contact_row(cursor, chat_jid)
+            if contact_row:
+                key = contact_row[0] or contact_row[1]
+                if key in seen_keys:
+                    continue
+            seen_keys.add(chat_jid)
+            is_lid = chat_jid.endswith("@lid")
+            result.append(Contact(
+                phone_number="" if is_lid else chat_jid.split("@")[0],
+                name=chat_name,
+                jid=chat_jid,
+                phone_jid="" if is_lid else chat_jid,
+                lid=chat_jid if is_lid else "",
+            ))
+
         return result
-        
+
     except sqlite3.Error as e:
         logger.error(f"Database error: {e}")
         return []
@@ -451,17 +701,23 @@ def search_contacts(query: str) -> List[Contact]:
 
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
     """Get all chats involving the contact.
-    
+
     Args:
-        jid: The contact's JID to search for
+        jid: The contact's JID, LID, or bare phone number — any known
+            identifier; the contacts table is used to expand to all forms.
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        cursor.execute("""
+
+        identifiers = _all_jids_for_identifier(cursor, jid)
+        if not identifiers:
+            return []
+        placeholders = ",".join(["?"] * len(identifiers))
+        params = list(identifiers) + list(identifiers) + [limit, page * limit]
+        cursor.execute(f"""
             SELECT DISTINCT
                 c.jid,
                 c.name,
@@ -471,10 +727,10 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 m.is_from_me as last_is_from_me
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender IN ({placeholders}) OR c.jid IN ({placeholders})
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
-        """, (jid, jid, limit, page * limit))
+        """, tuple(params))
         
         chats = cursor.fetchall()
         
@@ -501,13 +757,22 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
 
 
 def get_last_interaction(jid: str) -> str:
-    """Get most recent message involving the contact."""
+    """Get most recent message involving the contact.
+
+    Accepts any known identifier for the person — phone JID, @lid JID, or
+    bare digits — and expands it to all stored forms via the contacts table.
+    """
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT 
+
+        identifiers = _all_jids_for_identifier(cursor, jid)
+        if not identifiers:
+            return None
+        placeholders = ",".join(["?"] * len(identifiers))
+        params = list(identifiers) + list(identifiers)
+        cursor.execute(f"""
+            SELECT
                 m.timestamp,
                 m.sender,
                 c.name,
@@ -518,10 +783,10 @@ def get_last_interaction(jid: str) -> str:
                 m.media_type
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender IN ({placeholders}) OR c.jid IN ({placeholders})
             ORDER BY m.timestamp DESC
             LIMIT 1
-        """, (jid, jid))
+        """, tuple(params))
         
         msg_data = cursor.fetchone()
         
@@ -598,13 +863,22 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
 
 
 def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
-    """Get chat metadata by sender phone number."""
+    """Get chat metadata for a 1:1 conversation by any contact identifier.
+
+    Accepts a phone number (with or without punctuation), a phone JID, or an
+    @lid JID. Resolves to the most-recently-active matching chat — if a
+    person has both phone-JID and @lid chat rows, the newer wins.
+    """
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT 
+
+        identifiers = _all_jids_for_identifier(cursor, sender_phone_number)
+        if not identifiers:
+            return None
+        placeholders = ",".join(["?"] * len(identifiers))
+        cursor.execute(f"""
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
@@ -612,11 +886,12 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
             FROM chats c
-            LEFT JOIN messages m ON c.jid = m.chat_jid 
+            LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            WHERE c.jid IN ({placeholders}) AND c.jid NOT LIKE '%@g.us'
+            ORDER BY c.last_message_time DESC
             LIMIT 1
-        """, (f"%{sender_phone_number}%",))
+        """, tuple(identifiers))
         
         chat_data = cursor.fetchone()
         

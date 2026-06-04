@@ -20,10 +20,26 @@ mcp = FastMCP("whatsapp")
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
-    """Search WhatsApp contacts by name or phone number.
-    
+    """Search WhatsApp contacts by name, push name, phone number, JID, or LID.
+
+    Matches contact rows synced from WhatsApp's contact store. Each result
+    represents one real person — phone-JID and @lid entries for the same
+    person are already merged. Use the returned `jid` for downstream
+    send/lookup tools.
+
     Args:
-        query: Search term to match against contact names or phone numbers
+        query: Search term to match against contact names, phone numbers,
+            or identifiers. Phone numbers may include punctuation
+            (e.g. "+39 349 479 6763") — non-digit characters are stripped.
+
+    Returns:
+        A list of contacts. Each contact dict has:
+        - `name`: best display name (may be null for unsaved contacts)
+        - `phone_number`: bare phone digits if a phone JID is known, else ""
+        - `jid`: the preferred identifier for sending (phone JID if known,
+          otherwise the @lid)
+        - `phone_jid`: the `<number>@s.whatsapp.net` form (may be "")
+        - `lid`: the `<id>@lid` form (may be "")
     """
     contacts = whatsapp_search_contacts(query)
     return contacts
@@ -42,12 +58,18 @@ def list_messages(
     context_after: int = 1
 ) -> List[Dict[str, Any]]:
     """Get WhatsApp messages matching specified criteria with optional context.
-    
+
     Args:
         after: Optional ISO-8601 formatted string to only return messages after this date
         before: Optional ISO-8601 formatted string to only return messages before this date
-        sender_phone_number: Optional phone number to filter messages by sender
-        chat_jid: Optional chat JID to filter messages by chat
+        sender_phone_number: Optional contact identifier to filter messages by sender.
+            Accepts any known form for the person — bare phone number
+            (with or without punctuation), `<number>@s.whatsapp.net`, or
+            `<id>@lid` — and is expanded to all stored forms via the
+            contacts table.
+        chat_jid: Optional chat identifier to filter messages by chat.
+            Accepts either the `@s.whatsapp.net` or `@lid` form for 1:1
+            chats; both forms are matched if both exist.
         query: Optional search term to filter messages by content
         limit: Maximum number of messages to return (default 20)
         page: Page number for pagination (default 0)
@@ -78,7 +100,13 @@ def list_chats(
     sort_by: str = "last_active"
 ) -> List[Dict[str, Any]]:
     """Get WhatsApp chats matching specified criteria.
-    
+
+    Names are resolved through the contacts table where possible, so the
+    returned `name` is the contact's display name rather than a raw LID
+    identifier when known. 1:1 chats that exist under both `@s.whatsapp.net`
+    and `@lid` for the same person are deduplicated — only the most recently
+    active row is returned.
+
     Args:
         query: Optional search term to filter chats by name or JID
         limit: Maximum number of chats to return (default 20)
@@ -108,20 +136,27 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]
 
 @mcp.tool()
 def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
-    """Get WhatsApp chat metadata by sender phone number.
-    
+    """Get the 1:1 WhatsApp chat for a contact, resolved across both
+    identifier formats.
+
     Args:
-        sender_phone_number: The phone number to search for
+        sender_phone_number: Any known identifier for the person — bare
+            phone number (with or without punctuation), `<number>@s.whatsapp.net`,
+            or `<id>@lid`. If the person has both phone-JID and @lid chats,
+            the more recently active one wins.
     """
     chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
     return chat
 
 @mcp.tool()
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
-    """Get all WhatsApp chats involving the contact.
-    
+    """Get all WhatsApp chats involving the contact, across both identifier formats.
+
     Args:
-        jid: The contact's JID to search for
+        jid: Any known identifier for the person — phone JID
+            (`<number>@s.whatsapp.net`), @lid JID (`<id>@lid`), or bare
+            phone number. The contacts table is consulted to expand to
+            every form known for this person.
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
@@ -131,9 +166,11 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
 @mcp.tool()
 def get_last_interaction(jid: str) -> str:
     """Get most recent WhatsApp message involving the contact.
-    
+
     Args:
-        jid: The JID of the contact to search for
+        jid: Any known identifier for the contact — phone JID, @lid JID,
+            or bare phone number. Resolved across both formats via the
+            contacts table.
     """
     message = whatsapp_get_last_interaction(jid)
     return message
