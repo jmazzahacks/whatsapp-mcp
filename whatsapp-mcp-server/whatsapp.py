@@ -143,6 +143,31 @@ def _best_contact_name(row) -> str:
     return display or first or business or push or ""
 
 
+def _resolve_chat_name(cursor, chat_jid: str, fallback: Optional[str], cache: Optional[dict] = None) -> Optional[str]:
+    """Resolve a chat's display name through the contacts table for 1:1
+    chats. Groups (`@g.us`) are returned unchanged because their name is the
+    group name, not a contact name. Falls back to `fallback` (usually the
+    raw `chats.name` from the JOIN, which is often a bare @lid user-part)
+    when no contact match exists.
+
+    `cache` lets a caller that builds many Message rows for the same chat
+    avoid re-querying the contacts table per row.
+    """
+    if not chat_jid or chat_jid.endswith("@g.us"):
+        return fallback
+    if cache is not None and chat_jid in cache:
+        return cache[chat_jid]
+    result = fallback
+    contact = _lookup_contact_row(cursor, chat_jid)
+    if contact:
+        better = _best_contact_name(contact)
+        if better:
+            result = better
+    if cache is not None:
+        cache[chat_jid] = result
+    return result
+
+
 def _all_jids_for_identifier(cursor, identifier: str) -> List[str]:
     """Return every JID and bare-user form known for the person matched by
     `identifier`. Used to expand a phone-number lookup into the set of sender
@@ -327,13 +352,16 @@ def list_messages(
         
         cursor.execute(" ".join(query_parts), tuple(params))
         messages = cursor.fetchall()
-        
+
+        # One contact-resolution cache per call avoids re-querying for chats
+        # that appear in many message rows.
+        name_cache: dict = {}
         result = []
         for msg in messages:
             message = Message(
                 timestamp=datetime.fromisoformat(msg[0]),
                 sender=msg[1],
-                chat_name=msg[2],
+                chat_name=_resolve_chat_name(cursor, msg[5], msg[2], name_cache),
                 content=msg[3],
                 is_from_me=msg[4],
                 chat_jid=msg[5],
@@ -386,10 +414,12 @@ def get_message_context(
         if not msg_data:
             raise ValueError(f"Message with ID {message_id} not found")
             
+        # Per-call cache; all context messages share the same chat_jid.
+        name_cache: dict = {}
         target_message = Message(
             timestamp=datetime.fromisoformat(msg_data[0]),
             sender=msg_data[1],
-            chat_name=msg_data[2],
+            chat_name=_resolve_chat_name(cursor, msg_data[5], msg_data[2], name_cache),
             content=msg_data[3],
             is_from_me=msg_data[4],
             chat_jid=msg_data[5],
@@ -412,7 +442,7 @@ def get_message_context(
             before_messages.append(Message(
                 timestamp=datetime.fromisoformat(msg[0]),
                 sender=msg[1],
-                chat_name=msg[2],
+                chat_name=_resolve_chat_name(cursor, msg[5], msg[2], name_cache),
                 content=msg[3],
                 is_from_me=msg[4],
                 chat_jid=msg[5],
@@ -435,7 +465,7 @@ def get_message_context(
             after_messages.append(Message(
                 timestamp=datetime.fromisoformat(msg[0]),
                 sender=msg[1],
-                chat_name=msg[2],
+                chat_name=_resolve_chat_name(cursor, msg[5], msg[2], name_cache),
                 content=msg[3],
                 is_from_me=msg[4],
                 chat_jid=msg[5],
@@ -494,11 +524,41 @@ def list_chats(
             
         where_clauses = []
         params = []
-        
+
         if query:
-            where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
-            params.extend([f"%{query}%", f"%{query}%"])
-            
+            # The chat's stored `chats.name` is sometimes a raw @lid user-part
+            # (for contacts the user hasn't saved a label for), so a LIKE on
+            # `chats.name` alone misses chats whose only human name lives in
+            # the contacts table. Pre-resolve the query against contacts and
+            # widen the WHERE to also match any chat JID owned by a matching
+            # contact.
+            pattern = f"%{query}%"
+            extra_jids: List[str] = []
+            try:
+                cursor.execute(f"""
+                    SELECT {_CONTACT_COLS}
+                    FROM contacts
+                    WHERE LOWER(display_name) LIKE LOWER(?)
+                       OR LOWER(push_name)    LIKE LOWER(?)
+                       OR LOWER(first_name)   LIKE LOWER(?)
+                       OR LOWER(business_name) LIKE LOWER(?)
+                """, (pattern, pattern, pattern, pattern))
+                for phone_jid, lid, *_ in cursor.fetchall():
+                    if phone_jid:
+                        extra_jids.append(phone_jid)
+                    if lid:
+                        extra_jids.append(lid)
+            except sqlite3.OperationalError as e:
+                logger.debug("Contacts table unavailable for list_chats query: %s", e)
+
+            clause = "LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?"
+            params.extend([pattern, pattern])
+            if extra_jids:
+                placeholders = ",".join(["?"] * len(extra_jids))
+                clause += f" OR chats.jid IN ({placeholders})"
+                params.extend(extra_jids)
+            where_clauses.append(f"({clause})")
+
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
             
@@ -796,14 +856,14 @@ def get_last_interaction(jid: str) -> str:
         message = Message(
             timestamp=datetime.fromisoformat(msg_data[0]),
             sender=msg_data[1],
-            chat_name=msg_data[2],
+            chat_name=_resolve_chat_name(cursor, msg_data[5], msg_data[2]),
             content=msg_data[3],
             is_from_me=msg_data[4],
             chat_jid=msg_data[5],
             id=msg_data[6],
             media_type=msg_data[7]
         )
-        
+
         return format_message(message)
         
     except sqlite3.Error as e:
@@ -819,41 +879,58 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        query = """
-            SELECT 
+
+        # The message columns only resolve when the LEFT JOIN below is
+        # present; without it the SELECT references unknown columns and
+        # SQLite errors out. Select NULLs in that case to keep a constant
+        # 6-column shape for the Chat(...) construction (same pattern as
+        # list_chats).
+        if include_last_message:
+            msg_cols = "m.content as last_message, m.sender as last_sender, m.is_from_me as last_is_from_me"
+        else:
+            msg_cols = "NULL as last_message, NULL as last_sender, NULL as last_is_from_me"
+
+        query = f"""
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
-                m.content as last_message,
-                m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                {msg_cols}
             FROM chats c
         """
-        
+
         if include_last_message:
             query += """
-                LEFT JOIN messages m ON c.jid = m.chat_jid 
+                LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
             """
-            
+
         query += " WHERE c.jid = ?"
         
         cursor.execute(query, (chat_jid,))
         chat_data = cursor.fetchone()
-        
+
         if not chat_data:
             return None
-            
+
+        # Same contact-name override as get_direct_chat_by_contact.
+        chat_name = chat_data[1]
+        if not chat_jid.endswith("@g.us"):
+            contact_row = _lookup_contact_row(cursor, chat_data[0])
+            if contact_row:
+                better_name = _best_contact_name(contact_row)
+                if better_name:
+                    chat_name = better_name
+
         return Chat(
             jid=chat_data[0],
-            name=chat_data[1],
+            name=chat_name,
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
             last_sender=chat_data[4],
             last_is_from_me=chat_data[5]
         )
-        
+
     except sqlite3.Error as e:
         logger.error(f"Database error: {e}")
         return None
@@ -894,19 +971,29 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         """, tuple(identifiers))
         
         chat_data = cursor.fetchone()
-        
+
         if not chat_data:
             return None
-            
+
+        # Prefer the contact's display name over chats.name. The latter is
+        # often a raw @lid user-part for contacts the user hasn't labeled,
+        # which is useless to a caller asking "who is this".
+        chat_name = chat_data[1]
+        contact_row = _lookup_contact_row(cursor, chat_data[0])
+        if contact_row:
+            better_name = _best_contact_name(contact_row)
+            if better_name:
+                chat_name = better_name
+
         return Chat(
             jid=chat_data[0],
-            name=chat_data[1],
+            name=chat_name,
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
             last_sender=chat_data[4],
             last_is_from_me=chat_data[5]
         )
-        
+
     except sqlite3.Error as e:
         logger.error(f"Database error: {e}")
         return None
