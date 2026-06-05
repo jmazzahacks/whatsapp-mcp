@@ -1386,6 +1386,27 @@ func main() {
 		return
 	}
 
+	// Singleton guard: refuse to start a second bridge against the same session
+	// keys. Two bridges sharing store/whatsapp.db both authenticate as the same
+	// device, and WhatsApp's server boots whichever connected first with a
+	// StreamReplaced error — whatsmeow won't auto-reconnect from that by
+	// design, so the loser stays dead. The OS releases this flock on exit
+	// (even on crash), so there's no stale-lock concern.
+	lockFile, err := os.OpenFile("store/bridge.lock", os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		logger.Errorf("Failed to open lock file: %v", err)
+		return
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		existing, _ := os.ReadFile("store/bridge.lock")
+		logger.Errorf("Another whatsapp-bridge already holds the session (pid %s). Exiting to avoid a StreamReplaced war. Run `pkill -f whatsapp-client` first if you want to take over.", strings.TrimSpace(string(existing)))
+		os.Exit(2)
+	}
+	defer lockFile.Close()
+	lockFile.Truncate(0)
+	lockFile.Seek(0, 0)
+	fmt.Fprintf(lockFile, "%d\n", os.Getpid())
+
 	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
