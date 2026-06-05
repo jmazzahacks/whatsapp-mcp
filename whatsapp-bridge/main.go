@@ -1462,7 +1462,31 @@ func main() {
 			logger.Infof("Connected to WhatsApp")
 
 		case *events.LoggedOut:
-			logger.Warnf("Device logged out, please scan QR code to log in again")
+			logger.Warnf("Device logged out (on_connect=%v reason=%s) — re-pair by deleting whatsapp-bridge/store/whatsapp.db and restarting", v.OnConnect, v.Reason)
+
+		case *events.Disconnected:
+			logger.Infof("Disconnected from WhatsApp — whatsmeow will auto-reconnect")
+
+		case *events.StreamReplaced:
+			logger.Errorf("StreamReplaced: another client connected with this device's session keys; whatsmeow will NOT auto-reconnect. Most likely cause: a second whatsapp-bridge process sharing whatsapp-bridge/store/whatsapp.db, or this device was re-paired elsewhere. Check `lsof whatsapp-bridge/store/whatsapp.db` for duplicates.")
+
+		case *events.StreamError:
+			logger.Errorf("StreamError code=%s raw=%s", v.Code, v.Raw.XMLString())
+
+		case *events.ConnectFailure:
+			logger.Errorf("ConnectFailure reason=%s message=%q", v.Reason, v.Message)
+
+		case *events.TemporaryBan:
+			logger.Errorf("TemporaryBan: %s", v.String())
+
+		case *events.ClientOutdated:
+			logger.Errorf("ClientOutdated: WhatsApp rejected this build as too old; update the whatsmeow dependency (`go get -u go.mau.fi/whatsmeow && go mod tidy`)")
+
+		case *events.KeepAliveTimeout:
+			logger.Warnf("KeepAliveTimeout error_count=%d last_success=%s", v.ErrorCount, v.LastSuccess.Format(time.RFC3339))
+
+		case *events.KeepAliveRestored:
+			logger.Infof("KeepAliveRestored: keepalive pings working again")
 		}
 	})
 
