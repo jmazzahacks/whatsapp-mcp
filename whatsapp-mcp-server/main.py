@@ -1,4 +1,9 @@
+import asyncio
+import os
 from typing import List, Dict, Any, Optional
+
+import uvicorn
+from byteforge_loki_logging import configure_logging
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
@@ -16,7 +21,13 @@ from whatsapp import (
 )
 
 # Initialize FastMCP server
-mcp = FastMCP("whatsapp")
+mcp = FastMCP(
+    "whatsapp",
+    # Honor MCP_HOST/MCP_PORT as fallbacks so either env name pair works in Docker.
+    host=os.getenv("FASTMCP_HOST", os.getenv("MCP_HOST", "127.0.0.1")),
+    port=int(os.getenv("FASTMCP_PORT", os.getenv("MCP_PORT", "8000"))),
+    stateless_http=True,
+)
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -287,6 +298,57 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "message": "Failed to download media"
         }
 
+APPLICATION_TAG = "whatsapp-mcp"
+
+
+def _uvicorn_log_config_propagating_to_root() -> Dict[str, Any]:
+    """uvicorn log_config that routes uvicorn.* loggers through the root logger.
+
+    disable_existing_loggers must be False or dictConfig wipes the root handler
+    configure_logging() just installed; handlers=[] + propagate=True sends
+    uvicorn records up to root, where byteforge-loki-logging ships them.
+    """
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "loggers": {
+            "uvicorn": {"handlers": [], "level": "INFO", "propagate": True},
+            "uvicorn.access": {"handlers": [], "level": "INFO", "propagate": True},
+            "uvicorn.error": {"handlers": [], "level": "INFO", "propagate": True},
+        },
+    }
+
+
+def main() -> None:
+    # stdio for local hosts (Claude Desktop / Cursor); streamable-http in Docker
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport not in ("stdio", "streamable-http"):
+        raise SystemExit(f"Unknown MCP_TRANSPORT: {transport} (expected: stdio, streamable-http)")
+
+    if transport == "stdio":
+        # stdout carries the JSON-RPC stream, and configure_logging() attaches a
+        # stdout handler in local mode, so stdio skips it entirely.
+        mcp.run(transport="stdio")
+        return
+
+    log_level = os.getenv("LOG_LEVEL", "INFO")
+    configure_logging(
+        application_tag=APPLICATION_TAG,
+        debug_local=os.getenv("DEBUG_LOCAL", "true").lower() == "true",
+        local_level=log_level,
+    )
+
+    # Drive uvicorn directly: mcp.run() builds its uvicorn.Config without a
+    # log_config, so uvicorn's own handlers would bypass root (and Loki).
+    uv_config = uvicorn.Config(
+        mcp.streamable_http_app(),
+        host=mcp.settings.host,
+        port=mcp.settings.port,
+        log_level=log_level.lower(),
+        log_config=_uvicorn_log_config_propagating_to_root(),
+    )
+    asyncio.run(uvicorn.Server(uv_config).serve())
+
+
 if __name__ == "__main__":
-    # Initialize and run the server
-    mcp.run(transport='stdio')
+    main()

@@ -1,0 +1,27 @@
+services:
+  whatsapp-mcp:
+    image: ghcr.io/jmazzahacks/whatsapp-mcp:latest
+    container_name: whatsapp-mcp
+    restart: unless-stopped
+    ports:
+      # Loopback only: this endpoint can read and send WhatsApp messages, so
+      # it must only be reachable through nginx + Gatekeeper, never directly.
+      - "127.0.0.1:8000:8000"
+    environment:
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8000
+      FASTMCP_HOST: 0.0.0.0
+      FASTMCP_PORT: 8000
+      # Logging (byteforge-loki-logging) — MCP server and bridge both ship
+      # under application="whatsapp-mcp"; bridge lines have logger="bridge"
+      DEBUG_LOCAL: "false"
+      LOG_LEVEL: INFO
+      LOKI_ENDPOINT: ${LOKI_ENDPOINT}
+      LOKI_USER: ${LOKI_USER}
+      LOKI_PASSWORD: ${LOKI_PASSWORD}
+      LOKI_CA_BUNDLE_PATH: /app/certs/loki-ca.pem
+    volumes:
+      # whatsapp.db (session keys) + messages.db. Host dir must be owned by uid 1000.
+      - ./store:/app/whatsapp-bridge/store
+      - ${LOKI_CA_BUNDLE_HOST_PATH}:/app/certs/loki-ca.pem:ro

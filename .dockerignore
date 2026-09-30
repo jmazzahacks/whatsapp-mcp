@@ -1,0 +1,47 @@
+bin/
+lib/
+lib64/
+include/
+pyvenv.cfg
+.venv/
+**/.venv/
+.Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+.git/
+.gitignore
+.env
+VERSION
+*.md
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Never bake the WhatsApp session keys / message history or the local Mac
+# binary into the image
+whatsapp-bridge/store/
+store/
+**/store/
+whatsapp-bridge/whatsapp-client
+**/*.db
+**/*.db-journal
+**/*.db-wal
+**/*.db-shm
+**/*.db.bak-*
+
+# Local machine config
+.claude/
+.mcp.json
+claude_desktop_config.json
+whatsapp.log
+example-use.png

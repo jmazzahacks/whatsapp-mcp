@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.28.1",
-    "mcp[cli]>=1.6.0",
+    "mcp[cli]>=1.8,<2.0",
     "requests>=2.32.3",
+    # Logging with Loki support (public GitHub library)
+    "byteforge-loki-logging @ git+https://github.com/jmazzahacks/byteforge-loki-logging.git",
 ]
