@@ -1492,7 +1492,7 @@ func main() {
 			logger.Errorf("StreamReplaced: another client connected with this device's session keys; whatsmeow will NOT auto-reconnect. Most likely cause: a second whatsapp-bridge process sharing whatsapp-bridge/store/whatsapp.db, or this device was re-paired elsewhere. Check `lsof whatsapp-bridge/store/whatsapp.db` for duplicates.")
 
 		case *events.StreamError:
-			logger.Errorf("StreamError code=%s raw=%s", v.Code, v.Raw.XMLString())
+			logger.Errorf("StreamError code=%s raw=%s", v.Code, v.Raw.String())
 
 		case *events.ConnectFailure:
 			logger.Errorf("ConnectFailure reason=%s message=%q", v.Reason, v.Message)
