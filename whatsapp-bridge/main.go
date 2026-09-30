@@ -781,6 +781,42 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
+// checkSendableMediaPath only allows files inside a per-chat folder under
+// store/ (where downloadMedia saves attachments). media_path can come from a
+// prompt-injected tool call, so without this any readable file — including
+// store/whatsapp.db with the device's session keys — could be sent to anyone.
+func checkSendableMediaPath(mediaPath string) error {
+	absPath, err := filepath.Abs(mediaPath)
+	if err != nil {
+		return err
+	}
+	realPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return err
+	}
+	absStore, err := filepath.Abs("store")
+	if err != nil {
+		return err
+	}
+	realStore, err := filepath.EvalSymlinks(absStore)
+	if err != nil {
+		return err
+	}
+
+	rel, err := filepath.Rel(realStore, realPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("path is outside the media store")
+	}
+	// Files directly in store/ are the databases and lock file, not media
+	if !strings.Contains(rel, string(filepath.Separator)) {
+		return fmt.Errorf("path is not inside a chat media folder")
+	}
+	if strings.Contains(strings.ToLower(filepath.Base(realPath)), ".db") {
+		return fmt.Errorf("database files cannot be sent")
+	}
+	return nil
+}
+
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
@@ -811,6 +847,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Check if we have media to send
 	if mediaPath != "" {
+		if err := checkSendableMediaPath(mediaPath); err != nil {
+			return false, fmt.Sprintf("Refusing to send media file: %v", err)
+		}
+
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
@@ -1173,13 +1213,27 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
+	// filename is sender-controlled (a document's name), so drop any path
+	// components — otherwise "../" escapes store/ and writes anywhere we can.
+	filename = filepath.Base(filepath.Clean("/" + filename))
+	if filename == "/" || filename == "." || filename == ".." {
+		return false, "", "", "", fmt.Errorf("invalid media filename")
+	}
+
 	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	localPath = filepath.Join(chatDir, filename)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
+	}
+	absChatDir, err := filepath.Abs(chatDir)
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
+	}
+	if filepath.Dir(absPath) != absChatDir {
+		return false, "", "", "", fmt.Errorf("media path escapes chat directory")
 	}
 
 	// Check if file already exists
@@ -1358,7 +1412,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Loopback only: the API sends as the user with no auth, and the MCP server
+	// always reaches it on localhost (same host, or same container in Docker).
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block.
