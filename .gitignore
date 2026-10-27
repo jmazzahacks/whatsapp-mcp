@@ -10,6 +10,9 @@ whatsapp-bridge/store/
 # Local Claude Code config (machine-specific paths / personal automations)
 .claude/
 .mcp.json
+# Local Codex configuration and project-instructions symlink
+/.codex/
+/AGENTS.md
 # Docker build versioning / local env
 VERSION
 .env
