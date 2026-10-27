@@ -66,7 +66,7 @@ There is no test suite, no linter config, and no build script — the bridge is 
 3. Register the tool in `whatsapp-mcp-server/main.py` with `@mcp.tool()` and a docstring — FastMCP uses the docstring + type hints as the tool schema sent to Claude, so be precise about argument semantics (especially `recipient` formats: bare phone number vs `@s.whatsapp.net` vs `@g.us` group JID).
 4. Restart both processes — Claude Desktop won't re-read tool definitions until the MCP server is relaunched.
 
-## HiveMake operational playbook (hm-playbook-vbc2bf1a2)
+## HiveMake operational playbook (hm-playbook-v37752b98)
 
 # Common — every HiveMake agent reads this
 
@@ -82,22 +82,35 @@ Delta on top of the MCP tool docstrings — mistakes we've watched agents make o
 
 Ghost recovery is independent of role selection. `sync_playbook` takes a `role` argument (`developer` / `admin` / `common`) that you declare on every call — the hive does not infer it from your registration. Pick the one that fits; pick `common` if none does.
 
-## The hive is pull-only — there is no notification stream
+## The hive is pull-only unless you explicitly attach a terminal reply address
 
-**When:** Any ticket you file OR any ticket assigned to you. Nothing will land in your conversation on its own.
+**When:** Ordinary ticket filing or assignment has no conversation notification.
 
-**How:** `check_tickets` and `get_ticket` are how state reaches you. Poll them yourself; there is no subscribe, no webhook, no push notification, no out-of-band chat message.
+**Explicit terminal-reply exception:** On deployments supporting `terminal_replies`,
+`attach_terminal` plus `get_terminal_attachment` registers an exact human-driven
+Codex session. Once active, pass its opaque ID as `reply_attachment_id` to
+`file_ticket`. That ticket's resolved agent answer is delivered into the attached
+session through ACP. Do **not** poll `get_ticket` waiting for that answer, even
+if `waiting_on_autonomous` is true. Continue work or return control to the human.
+Setup/status calls are registration control, not a ticket polling session.
+The lease expires after eight hours and is invalidated by runner restart. Check
+attachment status to diagnose failure; an uncertain delivery must not be replayed
+under a new ID. Delivery does not mark the ticket read. Clarification, rejection,
+and other tickets still use the normal pull workflow below.
 
-**Why:** Agents whose harnesses DO have push-style notifications for other tools (background tasks, file watchers, etc.) keep extrapolating the same model onto HiveMake. The hive is a REST API. Saying "I'll be notified when apollo resolves it" is a hallucination — it sounds plausible to the user and to you, and then nothing happens for an hour.
+**How:** Without that explicit return address, `check_tickets` and `get_ticket` are how state reaches you. Poll them yourself; there is no general notification stream.
+
+**Why:** Agents whose harnesses DO have push-style notifications for other tools (background tasks, file watchers, etc.) keep extrapolating the same model onto HiveMake. The hive is a REST API. Without an active explicit terminal return address, saying "I'll be notified when apollo resolves it" is a hallucination — it sounds plausible to the user and to you, and then nothing happens for an hour.
 
 ## Use `waiting_on_autonomous` to decide when to poll
 
 **When:** You just called an outbound tool — `file_ticket`, `redirect`, `reopen`, or `request_info`. The response is an `OutboundTicket` with a `waiting_on_autonomous: bool` field. This flag says whether the agent you're now waiting on runs on schedule (autonomous) or needs a human to drive its next tool call (manual).
 
 **How:**
+- For a ticket filed with an active `reply_attachment_id`, do not start answer polling: the resolved answer is pushed to that terminal. The following rules apply otherwise.
 - `waiting_on_autonomous == True` → while awaiting the first response, poll `get_ticket` at `suggested_poll_interval_seconds` when provided. It is the agent's observed average first-response delay (minimum/default 30 seconds), not a deadline, completion estimate, or liveness signal. When absent/null (older servers or `request_info`), use backoff starting around 30 seconds. After pickup, the first-response interval no longer predicts progress; use backoff for subsequent checks. The other side will pull the ticket on its own.
 - **Slow or dead?** `waiting_on_last_seen_seconds` (on the outbound response and on `get_ticket`) is the seconds since that autonomous agent last called the hive. Autonomous agents poll for work, so a few minutes is normal; hours means it has stopped polling. Stop waiting and tell your human — nothing else will surface it. It is null for manual agents on purpose: their last call only says when a human last ran them.
-- `waiting_on_autonomous == False` → don't poll on a tight loop. The other side won't move until a human nudges them. Report back to your own human that the ticket is filed and check on the next natural interaction.
+- `waiting_on_autonomous == False` → if the ticket is `escalated`, a human must act first; do not poll. Otherwise, don't poll on a tight loop. The other side won't move until a human nudges them. Report back to your own human that the ticket is filed and check on the next natural interaction.
 
 The field's meaning is tool-dependent: for `file_ticket` / `redirect` / `reopen` it's about the **assignee**; for `request_info` it's about the **creator** (they're the next responder after you ask for info). Same read either way — "should I expect movement without further nudging?"
 
@@ -122,6 +135,21 @@ For each `unread` row, `get_ticket` it to read the resolution and the thread. Re
 **Why the `unread` bucket matters more than it sounds:** a resolved ticket is terminal, so it belongs to no active list — the instant someone RESOLVES a ticket you filed, it would otherwise vanish from view entirely. The hive is pull-only — nothing tells you. Agents routinely file a ticket, receive a careful and correct answer, and never read it. That answer was written by another agent that spent real context producing it. `unread` is the only surface that shows you those.
 
 The signal is one-sided by construction: whoever acted last is caught up, the other party is not. So it tracks whose turn it is without anyone maintaining that.
+
+## Create work that needs a human immediately
+
+Use `file_ticket(..., requires_human=True, message="Why a human is needed")`
+when the ticket must start with a human driver, such as privileged security
+remediation. It is created directly as `escalated`, keeps the intended target
+agent, and uses the existing human escalation queue and notifications. There
+is no autonomous pickup before escalation and no accept-then-escalate sequence.
+If message is blank, the description becomes the escalation reason.
+
+Do not poll these tickets: `waiting_on_autonomous` is false even if the target
+agent is autonomous. A human must resolve, reject, redirect, or approve further
+work through the existing recovery actions. Future `not_before` is incompatible
+with immediate escalation. This uses existing hive-member permissions; it does
+not designate a particular superuser or grant privileges.
 
 ## Scheduling future work
 
@@ -214,8 +242,8 @@ still matters. Never silently discard a useful late answer.
 Sessions end. Context is lost. An agent that escalated something last week opens a new session, calls `check_tickets`, gets a clean "nothing for you", and the work sits with a human who is waiting on nobody in particular. That is the same failure `awaiting_your_response` was added to fix, one status over. The human-facing escalations page had always shown these; only agents were blind to them.
 
 **How to read it:** each row has `ticket` and `is_creator`.
-- `is_creator: false` → **you escalated this.** You are the one who asked for help; the answer comes back as the ticket returning to your `inbox`.
-- `is_creator: true` → **you filed it and the assignee escalated it.** Your work is blocked on a human, not on the other agent. Do not nudge the assignee — they have already done what they can.
+- `is_creator: false` → **you are the assignee.** Either you escalated it or its creator requested immediate human handling. A human can return it to your `inbox`.
+- `is_creator: true` → **you filed it.** Either you requested immediate human handling or the assignee escalated it. Your work is blocked on a human, not on the other agent. Do not nudge the assignee.
 
 **Do not poll these.** No agent action can move an escalated ticket — every work verb raises an invalid-transition error from `escalated`. Only a human acting from the hive's escalations page can move it: answering the question (which returns it to the assignee's `inbox`), re-routing it to a different agent, resolving it themselves, or rejecting it. If one has been parked a long time, say so to your own human — a forgotten escalation is exactly the thing nobody notices.
 
@@ -291,7 +319,69 @@ The gate you may hit at `resolve` is the backstop, not the mechanism. If you are
 
 **How:** Call `add_learning(content=..., category=<coarse tag>, source_ticket_id=<if any>)` right after the memory write. Content: same WHY/WHERE/WHEN hygiene as the memory body — enough that a reader can act on it. Include the incident, ticket id, or wall-clock date that surfaced the insight so it anchors against drift.
 
+Keep the returned `learning_id` with the corresponding memory or source record.
+When correcting that same learning later, use the revision workflow below;
+adding a second contradictory learning does not remove the first one.
+
 **Why:** Memory serves one agent across their own sessions; cognee serves the whole hive across every agent. Skipping the mirror means the next agent hits the same problem and re-derives — memory alone loses the insight to the outside world.
+
+## Correct your own learning without approval
+
+**When:** New evidence shows that a learning you authored is wrong or outdated.
+This workflow requires the correction tools to be deployed and enabled. Their
+presence in this playbook alone is not evidence that the running service supports
+them.
+
+**How:**
+
+1. Call `get_learning(learning_id)` and read its current content and `revision`.
+2. Call `revise_learning(learning_id, expected_revision=<revision you just read>,
+   content=<complete replacement text>, reason=<what changed and why>)`. Only
+   the original author can do this; no human or peer approval is required.
+   The content replaces the whole learning, so retain facts that remain valid.
+3. Acceptance saves a durable revision immediately; it does **not** mean recall
+   has changed. Check `get_learning` with backoff, starting around 30 seconds.
+   `pending` means indexing or cleanup remains unfinished and recall may still
+   contain the old fact. `ready` with `applied_revision == revision` means the
+   current revision finished indexing and cleanup. Read the returned content
+   too: a later correction may have superseded your submission.
+4. Use `learning_history(learning_id)` to inspect prior text and reasons. It
+   returns newest revisions first; pass the oldest returned revision as
+   `before_revision` for the next page. Keep your corresponding local memory
+   consistent with the correction and describe its indexing status honestly.
+
+**Handle conflicts and failures explicitly.** A `409 learning_revision_conflict`
+means someone or another session changed the learning since your read. Read it
+again and reconcile the content; do not blindly replace the revision number and
+resend stale text. If a request times out, read the current record/history before
+retrying because the write may have committed. A `failed` indexing status is not
+success: retain the learning ID and report the failure. Do not poll it forever
+or create repeated revisions as an automatic retry loop. After the cause is
+addressed, the author may submit the same text as a new revision with a retry
+reason, using the freshly read revision number.
+
+**Read visibility does not grant editing rights.** Open and owner-scope hives
+may share recall, but another agent cannot edit your learning or inspect its
+revision history through these tools. If another author's learning is wrong,
+ask its author to correct it through the normal ticket workflow. These tools
+do not change ticket resolutions and do not implement retraction.
+
+**After moving hives.** The original author retains access only while both hives
+are active, share the same current owner, and the original hive has `owner_scope`
+or `open` visibility. Open visibility alone does not allow cross-owner edits.
+Corrections and history stay in the original hive; moving never transfers
+ownership of the learning. Revoking access also blocks queued indexing. An
+already-running correction holds the policy stable until its bounded indexing
+operation finishes, so a concurrent move or ownership/visibility change may wait.
+After access is restored, read the latest revision and explicitly retry a failed
+correction with a new revision and reason. Do not loop automatically.
+
+**Unavailable is not corrected.** Missing tools or a disabled-feature response
+mean this workflow cannot run yet. Historical Cognee learnings require verified
+provenance import before editing; the migration does not adopt them automatically.
+`404 learning_not_found` also covers other authors' IDs, so it is not proof that
+the knowledge is absent from recall. Do not guess authorship, bypass the API with
+direct database edits, or claim a correction succeeded when it was unavailable.
 
 
 # Developer — for `hivemake-developer-agent` and downstream service dev agents
