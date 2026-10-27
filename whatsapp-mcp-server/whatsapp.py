@@ -1029,7 +1029,7 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
-def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
+def send_file(recipient: str, media_path: str, caption: str = "") -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
@@ -1040,28 +1040,33 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
+        if caption and media_path.lower().endswith(".ogg"):
+            return False, "Voice messages do not support captions"
         
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
-            "media_path": media_path
+            "media_path": media_path,
+            "message": caption,
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=(5, 180))
         
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
-            return result.get("success", False), result.get("message", "Unknown response")
+            if result.get("success") is True:
+                return True, "File sent successfully"
+            return False, "Bridge reported a file-send failure; check the chat before retrying"
         else:
-            return False, f"Error: HTTP {response.status_code} - {response.text}"
+            return False, f"Bridge returned HTTP {response.status_code}; check the chat before retrying"
             
-    except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
+    except requests.RequestException:
+        return False, "File-send outcome unknown; check the chat before retrying"
     except json.JSONDecodeError:
-        return False, f"Error parsing response: {response.text}"
-    except Exception as e:
-        return False, f"Unexpected error: {str(e)}"
+        return False, "File-send outcome unknown; check the chat before retrying"
+    except Exception:
+        return False, "File-send outcome unknown; check the chat before retrying"
 
 def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
     try:

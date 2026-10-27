@@ -1,10 +1,16 @@
 import asyncio
 import os
+from collections.abc import Sequence
 from typing import List, Dict, Any, Optional
 
 import uvicorn
+from byteforge_mcp_file_friend_models import FileReference
 from byteforge_loki_logging import configure_logging
+from file_attachments import FileSendRequest, send_attachment
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ContentBlock
+from pydantic import ValidationError
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
     list_messages as whatsapp_list_messages,
@@ -15,13 +21,26 @@ from whatsapp import (
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message,
-    send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
 )
 
+class WhatsAppMCP(FastMCP):
+    """Keep capability references out of framework-generated error responses."""
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Sequence[ContentBlock] | dict[str, Any]:
+        try:
+            return await super().call_tool(name, arguments)
+        except ToolError as error:
+            if name != "send_file":
+                raise
+            if isinstance(error.__cause__, ValidationError):
+                raise ToolError("Invalid file-send arguments") from None
+            raise ToolError("File-send outcome unknown; check the chat before retrying") from None
+
+
 # Initialize FastMCP server
-mcp = FastMCP(
+mcp = WhatsAppMCP(
     "whatsapp",
     # Honor MCP_HOST/MCP_PORT as fallbacks so either env name pair works in Docker.
     host=os.getenv("FASTMCP_HOST", os.getenv("MCP_HOST", "127.0.0.1")),
@@ -236,7 +255,12 @@ def send_message(
     }
 
 @mcp.tool(structured_output=False)
-def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
+async def send_file(
+    recipient: str,
+    media_path: Optional[str] = None,
+    file_reference: Optional[FileReference] = None,
+    caption: str = "",
+) -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
     
     Args:
@@ -244,17 +268,24 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         media_path: The absolute path to the media file to send (image, video, document).
             Must be a file previously saved by download_media (inside a chat folder
-            under the bridge store); any other path is refused.
+            under the bridge store); any other path is refused. Choose exactly one
+            of media_path or file_reference. Desktop paths are not accessible here.
+        file_reference: Complete ready JSON reference returned by File Friend upload.
+            Downloads are verified before sending, limited to 16 MiB and 120 seconds.
+            Pass the reference object, not a URL, JSON filename, or file bytes.
+        caption: Optional text accompanying an image, video or document. Ogg voice
+            messages do not support captions. An uncertain send must not be retried
+            without checking the chat first.
     
     Returns:
         A dictionary containing success status and a status message
     """
     
-    # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path)
+    request = FileSendRequest(recipient, media_path, file_reference, caption)
+    result = await asyncio.to_thread(send_attachment, request)
     return {
-        "success": success,
-        "message": status_message
+        "success": result.success,
+        "message": result.message
     }
 
 @mcp.tool(structured_output=False)

@@ -38,7 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
 WORKDIR /app/whatsapp-mcp-server
 COPY --from=python-build /app/whatsapp-mcp-server/.venv ./.venv
 COPY whatsapp-mcp-server/main.py whatsapp-mcp-server/whatsapp.py whatsapp-mcp-server/audio.py \
-     whatsapp-mcp-server/bridge_log_forwarder.py ./
+     whatsapp-mcp-server/bridge_log_forwarder.py whatsapp-mcp-server/file_attachments.py ./
 
 WORKDIR /app/whatsapp-bridge
 COPY --from=bridge-build /src/whatsapp-client ./whatsapp-client

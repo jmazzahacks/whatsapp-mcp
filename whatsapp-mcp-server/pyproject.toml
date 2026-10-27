@@ -1,10 +1,11 @@
 [project]
 name = "whatsapp-mcp-server"
-version = "0.1.0"
+version = "0.2.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
+    "byteforge-mcp-file-friend-api-python @ git+https://github.com/jmazzahacks/byteforge-mcp-file-friend-api-python.git@c905f2c1d3f12ef466f204b31e3ceb53a2d3cf53",
     "httpx>=0.28.1",
     "mcp[cli]>=1.8,<2.0",
     "requests>=2.32.3",
