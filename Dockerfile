@@ -2,7 +2,7 @@
 # MCP server. entrypoint.sh supervises them.
 
 # --- Stage 1: build the Go bridge (CGO required by go-sqlite3) ---
-FROM golang:1.26-trixie AS bridge-build
+FROM golang:1.26.10-trixie AS bridge-build
 
 WORKDIR /src
 COPY whatsapp-bridge/go.mod whatsapp-bridge/go.sum ./
@@ -11,11 +11,11 @@ COPY whatsapp-bridge/main.go ./
 RUN CGO_ENABLED=1 go build -o whatsapp-client .
 
 # --- Stage 2: Python deps (git needed for the GitHub-hosted logging libs) ---
-FROM python:3.13-slim-trixie AS python-build
+FROM python:3.13.18-slim-trixie AS python-build
 
-RUN apt-get update && apt-get install -y --no-install-recommends git \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=ghcr.io/astral-sh/uv:0.9.28 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.6 /uv /usr/local/bin/uv
 
 # Same path as the runtime stage so the venv's absolute paths stay valid
 WORKDIR /app/whatsapp-mcp-server
@@ -26,10 +26,10 @@ ENV UV_PYTHON_DOWNLOADS=never \
 RUN uv sync --frozen --no-dev --no-install-project
 
 # --- Stage 3: runtime ---
-FROM python:3.13-slim-trixie
+FROM python:3.13.18-slim-trixie
 
 # ffmpeg: audio.py converts audio to Opus .ogg before sending voice messages
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Layout mirrors the repo: whatsapp.py resolves messages.db as

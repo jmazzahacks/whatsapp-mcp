@@ -40,6 +40,7 @@ NEXT_VERSION=$((CURRENT_VERSION + 1))
 echo "Building ${REGISTRY}:${NEXT_VERSION}..."
 
 docker build \
+    --pull \
     --platform linux/amd64 \
     $NO_CACHE \
     -t "${REGISTRY}:${NEXT_VERSION}" \
